@@ -1,0 +1,7 @@
+lrwxrwxrwx 1 root root 0 Mar 24 19:22 /sys/class/tpm/tpm0/device/driver -> ../../../bus/platform/drivers/ftpm-tee
+DRIVER=ftpm-tee
+OF_NAME=ftpm
+OF_FULLNAME=/firmware/ftpm
+OF_COMPATIBLE_0=microsoft,ftpm
+OF_COMPATIBLE_N=1
+MODALIAS=of:NftpmT(null)Cmicrosoft,ftpm

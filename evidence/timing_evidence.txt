@@ -1,0 +1,13 @@
+[    0.000000] efi: RTPROP=0x1027f8f198 TPMFinalLog=0x1018b50000 SMBIOS=0xffff0000 SMBIOS 3.0=0x1027980000 MEMATTR=0x1021990018 ESRT=0x10218fcc18 TPMEventLog=0x1018b68018 RNG=0x1015190018 MEMRESERVE=0x1018b6ac18 
+[    0.000000] Kernel command line: root=/dev/mmcblk0p1 rw rootwait rootfstype=ext4 mminit_loglevel=4 console=ttyTCU0,115200 console=ttyAMA0,115200 firmware_class.path=/etc/firmware fbcon=map:0 video=efifb:off console=tty0 ima_policy=tcb ima_hash=sha256 ima_template=ima-ng bl_prof_dataptr=2031616@0x102C610000 bl_prof_ro_ptr=65536@0x102C600000 
+[    0.261754] device-mapper: core: CONFIG_IMA_DISABLE_HTABLE is disabled. Duplicate IMA measurements will not be recorded in the IMA log.
+[    3.764685] optee: probing for conduit method.
+[    3.764735] optee: revision 4.2 (d78bc5fa)
+[    3.823894] optee: dynamic shared memory is enabled
+[    3.824153] optee: initialized driver
+[    3.896188] ima: No TPM chip found, activating TPM-bypass!
+[    3.896213] ima: Allocated hash algorithm: sha256
+[    3.896299] ima: No architecture policies found
+[    5.654323] systemd[1]: systemd 249.11-0ubuntu3.20 running in system mode (+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT +GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY -P11KIT -QRENCODE +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified)
+[    8.172268] nvpps c6a0000.nvpps: primary-emac found ethernet@6800000
+[    8.172280] nvpps c6a0000.nvpps: primary emac base address 0x6810000

@@ -45,6 +45,9 @@ OP-TEE (which hosts the fTPM) does not initialize until **3.824 seconds**.
 By the time fTPM becomes accessible, IMA has already given up and activated
 bypass mode. As a result, IMA measurements are not extended into TPM PCR[10].
 
+![Timing Gap](evidence/screenshots/screenshot_3_timing_gap.png)
+*dmesg output showing IMA gives up at 1.806s, OP-TEE ready at 3.824s — a 2 second gap*
+
 ### Why This Happens
 
 On Jetson AGX Orin, there is no physical TPM chip. Instead, TPM 2.0 is
@@ -61,6 +64,9 @@ fTPM on Jetson (this platform):
   TEE bus probes AFTER kernel security subsystems
   IMA initializes BEFORE TEE bus is ready ❌
 ```
+
+![fTPM Driver Confirmation](evidence/screenshots/screenshot_4_ftpm_driver.png)
+*Confirms TPM is driven by ftpm-tee (firmware, not physical chip) with compatible = microsoft,ftpm*
 
 This is a known problem across multiple ARM platforms. See related issues:
 
@@ -81,7 +87,7 @@ NVIDIA Jetson AGX Orin with JetPack R36.4.4.**
 |---|---|
 | Device | NVIDIA Jetson AGX Orin Developer Kit |
 | JetPack | R36.4.4 |
-| Kernel | 5.15.148-tegra (OOT variant) |
+| Kernel | 5.15.148 (OOT variant, rebuilt with IMA) |
 | OP-TEE | 4.2 (d78bc5fa) |
 | TPM type | firmware TPM (microsoft,ftpm) |
 | TPM driver | tpm_ftpm_tee |
@@ -101,19 +107,38 @@ NVIDIA Jetson AGX Orin with JetPack R36.4.4.**
 │                                                             │
 │  Linux kernel                  fTPM TA                      │
 │    │                             │                          │
-│    IMA subsystem                 PCR[0..23] variables        │
+│    IMA subsystem                 PCR[0..23] variables       │
 │    measures files                                           │
 │    │                           Attestation TA (planned)     │
 │    Normal World Agent            │                          │
 │    │ (dumb pipe)                 reads PCR[0-7]             │
 │    │                             reads IMA log hash         │
 │    sends nonce ────────────────► reads ECID + fuse state    │
-│                                  signs with private key      │
+│                                  signs with private key     │
 │    receives token ◄──────────────│                          │
 │    │                                                        │
 │    forwards to verifier                                     │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Evidence
+
+### IMA Running — 6024 Measurements at Boot
+
+![IMA Running](evidence/screenshots/screenshot_1_ima_running.png)
+*IMA filesystem present, 6024 measurements recorded, first 5 entries shown*
+
+### TPM PCR Values — Boot Chain Measured, PCR[10] = 0
+
+![PCR Values](evidence/screenshots/screenshot_2_pcr_values.png)
+*PCR[0-7] extended by EDK2 firmware (non-zero), PCR[10] = all zeros (IMA bypass)*
+
+### Active IMA Policy
+
+![IMA Policy](evidence/screenshots/screenshot_5_ima_policy.png)
+*tcb policy active — measures all executed binaries, kernel modules, and firmware*
 
 ---
 
@@ -125,10 +150,11 @@ EDK2 UEFI firmware measures the boot chain before the kernel starts
 and extends values into fTPM PCRs:
 
 ```
-PCR[0] = 0x3D458CFE...  ← UEFI firmware hash
-PCR[1] = 0x22DC145D...  ← UEFI configuration
-PCR[4] = 0xA8147957...  ← bootloader hash
-PCR[7] = 0x65CAF8DD...  ← secure boot state
+PCR[0] = 0x3D458CFE55CC03EA...  ← UEFI firmware hash
+PCR[1] = 0x22DC145DBDAD7FD0...  ← UEFI configuration
+PCR[4] = 0xA8147957A22B75D3...  ← bootloader hash
+PCR[7] = 0x65CAF8DD1E0EA7A6...  ← secure boot state
+PCR[10]= 0x0000000000000000...  ← IMA not extending (timing issue)
 ```
 
 These are hardware-enforced. The kernel cannot modify them.
@@ -176,7 +202,6 @@ entries — IMA runs in kernel space.
 
 ```bash
 # verify IMA is not enabled on your Jetson
-grep "CONFIG_IMA" /proc/config.gz 2>/dev/null || \
 zcat /proc/config.gz | grep "CONFIG_IMA"
 # should show: # CONFIG_IMA is not set
 ```
@@ -234,8 +259,11 @@ sudo cp arch/arm64/boot/Image /boot/Image
 
 ```bash
 sudo vim /boot/extlinux/extlinux.conf
-# Add to APPEND line:
+# Add to primary APPEND line:
 # ima_policy=tcb ima_hash=sha256 ima_template=ima-ng
+#
+# Add backup label pointing to Image.backup.original
+# (no IMA parameters on backup — safe fallback)
 ```
 
 ### Step 7 — Remove duplicate fTPM module
@@ -281,6 +309,8 @@ sudo tpm2_pcrread sha256:0,1,2,3,4,5,6,7,8,9,10
         IMA already in bypass mode — too late
 ```
 
+Gap: **~2 seconds** between IMA checking and fTPM becoming available.
+
 ### Root Cause
 
 ```
@@ -297,13 +327,17 @@ Chain:
         → TPM available — but IMA already gave up
 ```
 
-### Why Setting CONFIG_TCG_FTPM_TEE=y Does Not Help
+### Why CONFIG_TCG_FTPM_TEE=y Does Not Help
 
 Even with fTPM built-in (not a module), the device probe is still
 deferred because it depends on the TEE bus, which cannot initialize
 before OP-TEE, which cannot start before TrustZone is configured by
-TF-A. This chain is hardware-determined and cannot be shortcut by
-changing module vs built-in status alone.
+TF-A. This chain is hardware-determined.
+
+Setting `CONFIG_TCG_FTPM_TEE=y` caused a secondary issue — the
+built-in driver conflicted with the old `.ko` file still present
+from `make modules_install`. Resolved by removing the `.ko` file.
+But even after resolving this, IMA still misses fTPM.
 
 ### What PCR[10] = 0 Means for Security
 
@@ -311,11 +345,13 @@ Without PCR[10] extension:
 
 - IMA log exists and is correct ✅
 - IMA log cannot be proven complete via hardware ⚠️
-- A kernel-level attacker could modify the IMA log without TPM detecting it
-- Userspace attackers still cannot fake IMA entries (kernel space protection)
+- A kernel-level attacker could modify the IMA log without detection
+- Userspace attackers still cannot fake IMA entries (kernel space)
 
 This is documented as a research limitation, consistent with standard
 attestation literature that assumes an uncompromised kernel.
+
+See [docs/problem-analysis.md](docs/problem-analysis.md) for full analysis.
 
 ---
 
@@ -331,14 +367,14 @@ attestation literature that assumes an uncompromised kernel.
     }
   },
   "boot_measurements": {
-    "pcr0": "0x3D458CFE...",
-    "pcr4": "0xA8147957...",
-    "pcr7": "0x65CAF8DD...",
+    "pcr0": "0x3D458CFE55CC03EA...",
+    "pcr4": "0xA8147957A22B75D3...",
+    "pcr7": "0x65CAF8DD1E0EA7A6...",
     "source": "EDK2-firmware-extended-fTPM"
   },
   "runtime_measurements": {
     "ima_measurement_count": 6024,
-    "ima_log_aggregate": "<sha256 of IMA log>",
+    "ima_log_aggregate": "<sha256 of entire IMA log>",
     "ima_policy": "tcb",
     "source": "IMA-kernel-space"
   },
@@ -359,19 +395,19 @@ attestation literature that assumes an uncompromised kernel.
 | Raspberry Pi | 5.15.y | Fixed — patch merged into RPi kernel |
 | Xilinx ZCU104 | 5.x | Open — OP-TEE issue #7248 |
 | TI TDA4VM | 6.1.80 | Open — TI E2E forum |
-| NVIDIA Jetson AGX Orin | 5.15.148 | **This work** |
+| NVIDIA Jetson AGX Orin | 5.15.148 | **This work — first documented** |
 
 ### Key References
 
 - Sailer et al., "Design and Implementation of a TCG-based Integrity
-  Measurement Architecture," USENIX Security 2004 — original IMA paper
-- Microsoft fTPM research paper:
+  Measurement Architecture," USENIX Security 2004
+- Microsoft fTPM paper:
   https://www.microsoft.com/en-us/research/wp-content/uploads/2017/06/ftpm1.pdf
 - Linux kernel IMA documentation:
   https://www.kernel.org/doc/html/latest/security/IMA-templates.html
 - Linux kernel fTPM documentation:
   https://docs.kernel.org/6.3/security/tpm/tpm_ftpm_tee.html
-- IETF RATS (Remote ATtestation procedureS): RFC 9334
+- IETF RATS RFC 9334
 - ARM PSA Attestation API specification
 
 ---
@@ -380,23 +416,31 @@ attestation literature that assumes an uncompromised kernel.
 
 ```
 jetson-ima-attestation/
-├── README.md                    ← this file
+├── README.md                         ← this file
 ├── docs/
-│   ├── problem-analysis.md      ← deep dive on fTPM+IMA timing
-│   ├── threat-model.md          ← security analysis
-│   └── architecture.md          ← system design
+│   ├── problem-analysis.md           ← deep dive on fTPM+IMA timing
+│   ├── threat-model.md               ← security analysis (planned)
+│   └── overhead-results.md           ← measurements (planned)
 ├── evidence/
-│   ├── dmesg_boot.txt           ← full boot log
-│   ├── ima_measurements.txt     ← IMA log sample
-│   ├── pcr_values.txt           ← TPM PCR readings
-│   ├── timing_evidence.txt      ← critical timing output
-│   ├── kernel_config_ima.txt    ← IMA kernel config
-│   └── ima_policy.txt           ← active IMA policy
+│   ├── dmesg_boot.txt                ← full boot log
+│   ├── ima_measurements.txt          ← IMA log sample
+│   ├── pcr_values.txt                ← TPM PCR readings
+│   ├── timing_evidence.txt           ← critical timing output
+│   ├── kernel_config_ima.txt         ← IMA kernel config
+│   ├── ima_policy.txt                ← active IMA policy
+│   ├── system_info.txt               ← platform details
+│   ├── tpm_driver.txt                ← TPM driver info
+│   └── screenshots/
+│       ├── screenshot_1_ima_running.png
+│       ├── screenshot_2_pcr_values.png
+│       ├── screenshot_3_timing_gap.png
+│       ├── screenshot_4_ftpm_driver.png
+│       └── screenshot_5_ima_policy.png
 ├── kernel/
-│   └── ima-build-steps.md       ← reproducible build guide
-├── ta/                          ← OP-TEE Attestation TA (planned)
-├── host/                        ← Normal World agent (planned)
-└── verifier/                    ← Remote verifier (planned)
+│   └── (IMA config and build notes)
+├── ta/                               ← OP-TEE Attestation TA (planned)
+├── host/                             ← Normal World agent (planned)
+└── verifier/                         ← Remote verifier (planned)
 ```
 
 ---
@@ -406,7 +450,7 @@ jetson-ima-attestation/
 If you are facing the same fTPM + IMA timing problem on another ARM
 platform, please open an issue or reference this repository.
 
-The upstream fix discussion is tracked at:
+Upstream fix discussion:
 - linux-integrity mailing list: linux-integrity@vger.kernel.org
 - OP-TEE GitHub: https://github.com/OP-TEE/optee_os/issues/7248
 

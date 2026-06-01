@@ -107,14 +107,14 @@ NVIDIA Jetson AGX Orin with JetPack R36.4.4.**
 │                                                             │
 │  Linux kernel                  fTPM TA                      │
 │    │                             │                          │
-│    IMA subsystem                 PCR[0..23] variables       │
+│    IMA subsystem                 PCR[0..23] variables        │
 │    measures files                                           │
 │    │                           Attestation TA (planned)     │
 │    Normal World Agent            │                          │
 │    │ (dumb pipe)                 reads PCR[0-7]             │
 │    │                             reads IMA log hash         │
 │    sends nonce ────────────────► reads ECID + fuse state    │
-│                                  signs with private key     │
+│                                  signs with private key      │
 │    receives token ◄──────────────│                          │
 │    │                                                        │
 │    forwards to verifier                                     │

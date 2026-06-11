@@ -1,0 +1,148 @@
+================================================================================
+ fTPM + IMA ordering — source-level root-cause trace
+ Captured 2026-06-10 on the Jetson AGX Orin (JetPack R36.4.4, kernel 5.15.148)
+ Kernel source tree: ~/kernel_build/kernel/kernel-jammy-src
+================================================================================
+
+This file backs the citations in docs/root-cause-analysis.md with the raw
+command output it was derived from. Commands were run on the target device.
+
+--------------------------------------------------------------------------------
+[1] IMA's TPM lookup is a one-shot at init
+    grep -rn "TPM-bypass|tpm_default_chip|ima_tpm_chip" \
+         security/integrity/ima/ima_init.c
+--------------------------------------------------------------------------------
+25:struct tpm_chip *ima_tpm_chip;
+75:	if (ima_tpm_chip) {
+123:	ima_tpm_chip = tpm_default_chip();
+124:	if (!ima_tpm_chip)
+125:		pr_info("No TPM chip found, activating TPM-bypass!\n");
+
+--------------------------------------------------------------------------------
+[2] IMA runs at late_initcall (one of the last kernel-init phases)
+    grep -rn "late_initcall|device_initcall|__initcall|subsys_initcall" \
+         security/integrity/ima/ima_main.c security/integrity/ima/ima_init.c
+--------------------------------------------------------------------------------
+ima_main.c:1077:late_initcall(init_ima);	/* Start IMA after the TPM is available */
+
+--------------------------------------------------------------------------------
+[3] fTPM is a tee_client_driver, registered at module_init
+    grep -n "module_init|module_tee_driver|module_platform_driver|_initcall|tee_client_driver" \
+         drivers/char/tpm/tpm_ftpm_tee.c
+--------------------------------------------------------------------------------
+382:static struct tee_client_driver ftpm_tee_driver = {
+415:module_init(ftpm_mod_init);
+
+--------------------------------------------------------------------------------
+[4] IMA init context (boot_aggregate + the one-shot lookup, lines 50-130)
+    sed -n '50,130p' security/integrity/ima/ima_init.c
+--------------------------------------------------------------------------------
+	... (struct hash / iint setup) ...
+
+	/*
+	 * With TPM 2.0 hash agility, ... Use the same hash algorithm for reading
+	 * the TPM PCRs as for calculating the boot aggregate digest. ...
+	 */
+	if (ima_tpm_chip) {
+		result = ima_calc_boot_aggregate(&hash.hdr);   <-- boot_aggregate only if chip present
+		if (result < 0) { ... }
+	}
+
+	result = ima_alloc_init_template(&event_data, &entry, NULL);
+	...
+	result = ima_store_template(entry, violation, NULL,
+				    boot_aggregate_name,
+				    CONFIG_IMA_MEASURE_PCR_IDX);
+	...
+
+int __init ima_init(void)
+{
+	int rc;
+
+	ima_tpm_chip = tpm_default_chip();              <-- ONE-SHOT, never retried
+	if (!ima_tpm_chip)
+		pr_info("No TPM chip found, activating TPM-bypass!\n");
+
+	rc = integrity_init_keyring(INTEGRITY_KEYRING_IMA);
+	...
+
+--------------------------------------------------------------------------------
+[5] Every extend / digest path is gated on ima_tpm_chip
+    grep -rn "ima_pcr_extend|tpm_pcr_extend|ima_tpm_chip" \
+         security/integrity/ima/ima_queue.c security/integrity/ima/ima_crypto.c
+--------------------------------------------------------------------------------
+ima_queue.c:138:static int ima_pcr_extend(struct tpm_digest *digests_arg, int pcr)
+ima_queue.c:142:	if (!ima_tpm_chip)                       <-- no chip => silent no-op
+ima_queue.c:145:	result = tpm_pcr_extend(ima_tpm_chip, pcr, digests_arg);
+ima_queue.c:220:	if (!ima_tpm_chip)
+ima_queue.c:223:	digests = kcalloc(ima_tpm_chip->nr_allocated_banks, ...);   <-- banks come from chip
+ima_queue.c:228:	for (i = 0; i < ima_tpm_chip->nr_allocated_banks; i++) {
+ima_crypto.c:102:	for (i = 0; i < NR_BANKS(ima_tpm_chip) + ima_extra_slots; i++)
+ima_crypto.c:128:	for (i = 0; i < NR_BANKS(ima_tpm_chip); i++) {
+ima_crypto.c:782:	if (!ima_tpm_chip)
+ima_crypto.c:785:	if (tpm_pcr_read(ima_tpm_chip, idx, d) != 0)
+    (NR_BANKS(chip) == 0 when chip is NULL, so the crypto bank arrays are
+     sized for the no-TPM layout at ima_init time.)
+
+--------------------------------------------------------------------------------
+[6] OP-TEE has TWO enumeration paths — sync vs supplicant-gated workqueue
+    grep -rn "optee_enumerate_devices|schedule_work|INIT_WORK|workqueue|..." \
+         drivers/tee/optee/
+--------------------------------------------------------------------------------
+core.c:217:	WARN_ON(optee_enumerate_devices(PTA_CMD_GET_DEVICES_SUPP));  <-- SUPP list
+core.c:245:	INIT_WORK(&optee->scan_bus_work, optee_bus_scan);
+core.c:246:	optee->scan_bus_wq = create_workqueue("optee_bus_scan");
+core.c:747:	rc = optee_enumerate_devices(PTA_CMD_GET_DEVICES);           <-- sync, in probe
+device.c:174:int optee_enumerate_devices(u32 func) { return __optee_enumerate_devices(func); }
+optee_private.h:84: * @scan_bus_wq  workqueue to scan optee bus and register optee drivers
+
+--------------------------------------------------------------------------------
+[7] The SUPP bus-scan is queued only when the supplicant context opens
+    grep -rn "scan_bus_work|optee_bus_scan|queue_work|supp" drivers/tee/optee/core.c
+--------------------------------------------------------------------------------
+215:static void optee_bus_scan(struct work_struct *work)
+230:	if (teedev == optee->supp_teedev) {        <-- triggered by the SUPPLICANT teedev
+233:		mutex_lock(&optee->supp.mutex);
+234:		if (!optee->supp.ctx) {
+236:			optee->supp.ctx = ctx;             <-- userspace tee-supplicant connects
+238:		mutex_unlock(&optee->supp.mutex);
+245:			INIT_WORK(&optee->scan_bus_work, optee_bus_scan);
+246:			optee->scan_bus_wq = create_workqueue("optee_bus_scan");
+251:			queue_work(optee->scan_bus_wq, &optee->scan_bus_work);  <-- THEN scan
+788:module_platform_driver(optee_driver);
+
+--------------------------------------------------------------------------------
+[8] DECISIVE: dmesg shows OP-TEE ready BEFORE IMA's check, yet no TPM found
+    sudo dmesg | grep -iE "tpm|ftpm|optee|ima:|supplicant"
+--------------------------------------------------------------------------------
+[    0.000000] efi: ... TPMFinalLog=... TPMEventLog=...   (firmware event log only)
+[    2.228108] optee: probing for conduit method.
+[    2.228162] optee: revision 4.2 (d78bc5fa)
+[    2.287449] optee: dynamic shared memory is enabled
+[    2.287706] optee: initialized driver                  <-- OP-TEE core READY @2.287s
+[    2.333121] ima: No TPM chip found, activating TPM-bypass!  <-- IMA @2.333s, STILL no chip
+[    2.333146] ima: Allocated hash algorithm: sha256
+[    2.333230] ima: No architecture policies found
+
+    NOTE: There is NO "tpm tpm0: ..." device-registration line anywhere in the
+    kernel-init dmesg. The fTPM chip is never enumerated during boot — it only
+    appears after userspace tee-supplicant connects and triggers optee_bus_scan.
+
+--------------------------------------------------------------------------------
+[9] tee-supplicant is not a tracked systemd unit on this image
+    systemctl status tee-supplicant ; journalctl -b -u tee-supplicant
+--------------------------------------------------------------------------------
+(no systemd unit output)
+-- No entries --
+    (fTPM works post-boot via tpm2_pcrread, so supplicant is started by some
+     other means in userspace — confirming the dependency is on USERSPACE, not
+     on any kernel-init phase.)
+
+================================================================================
+ CONCLUSION
+ OP-TEE core being up does NOT make the fTPM available. The fTPM device is
+ enumerated only after the userspace tee-supplicant daemon connects, because
+ the fTPM needs supplicant-mediated RPMB secure storage. IMA's late_initcall
+ runs entirely within kernel init, long before userspace exists, so it can
+ never see the fTPM. This is structural, not a tunable timing gap.
+================================================================================

@@ -1,0 +1,111 @@
+================================================================================
+ NVIDIA deliberately binds the fTPM to userspace — verbatim config evidence
+ Captured 2026-06-11 on the Jetson AGX Orin (JetPack R36.4.4, kernel 5.15.148)
+================================================================================
+
+This is the authoritative evidence for docs/root-cause-analysis.md: the fTPM is
+not "accidentally late," it is *intentionally* loaded from userspace, after
+tee-supplicant, because it needs supplicant-mediated RPMB storage. Kernel-init
+IMA therefore can never see it. The kernel-source trace in
+root_cause_source_trace.txt explains the *mechanism*; these config files prove
+the *intent*.
+
+--------------------------------------------------------------------------------
+[1] The fTPM kernel module is DENYLISTED from boot autoload
+    cat /etc/modprobe.d/denylist-tpm-ftpm-tee.conf
+--------------------------------------------------------------------------------
+    # SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES.
+    # SPDX-License-Identifier: BSD-3-Clause
+    #   ... (standard NVIDIA BSD-3-Clause header) ...
+    #
+    blacklist tpm_ftpm_tee
+
+    This is an NVIDIA-authored, copyrighted file whose sole directive is to
+    blacklist the fTPM module. It does NOT auto-load during kernel init; it is
+    loaded manually by the service in [2]. The NVIDIA copyright is itself proof
+    that the userspace binding is intentional, not an accident of probe order.
+
+--------------------------------------------------------------------------------
+[2] ...and is loaded MANUALLY from userspace, only AFTER tee-supplicant is up
+    systemctl cat nv-tee-supplicant.service
+--------------------------------------------------------------------------------
+[Unit]
+Description=OP-TEE Client Supplicant
+DefaultDependencies=no
+Conflicts=shutdown.target
+After=systemd-modules-load.service
+Before=sysinit.target shutdown.target
+
+[Service]
+Type=simple
+# Add retry count and interval to wait for tee-supplicant to start
+Environment=RETRY_COUNT=30
+Environment=RETRY_INTERVAL=0.1
+ExecStart=/etc/systemd/nv-tee-supplicant.sh
+# Wait for tee-supplicant to start and load tpm module
+# add "-" to avoid service launch failed with failing to probe tpm_ftpm_tee
+ExecStartPost=-/bin/sh -c '\
+    for i in $(seq 1 ${RETRY_COUNT}); do \
+        if pgrep -f "tee-supplicant" > /dev/null; then \
+            logger "tee-supplicant is running, loading tpm module"; \
+            modprobe tpm_ftpm_tee && exit 0; \
+        fi; \
+        sleep ${RETRY_INTERVAL}; \
+    done; \
+    logger "Failed to start tee-supplicant"; \
+    exit 1'
+
+Restart=always
+RestartSec=10s
+# Workaround for fTPM TA: stop kernel module before tee-supplicant
+ExecStop=-/bin/sh -c "/sbin/modprobe -v -r tpm_ftpm_tee ; /bin/kill $MAINPID"
+
+[Install]
+WantedBy=...
+
+    Key points:
+    - ExecStartPost: waits (up to 30 x 0.1s = 3s) for `pgrep tee-supplicant`,
+      THEN `modprobe tpm_ftpm_tee`. The fTPM is loaded only after supplicant.
+      The leading "-" tolerates failure (why a built-in CONFIG_TCG_FTPM_TEE=y
+      kernel just logs a harmless "modprobe: FATAL ... not found").
+    - ExecStop: "Workaround for fTPM TA" — unloads the fTPM module BEFORE
+      killing supplicant (clean teardown order so RPMB can flush). The whole
+      fTPM lifecycle (load + unload) is userspace-managed.
+
+--------------------------------------------------------------------------------
+[3] The fTPM's backing store (RPMB) isn't ready until 3.388s
+    sudo dmesg | grep -iE "rpmb"
+--------------------------------------------------------------------------------
+[    3.387907] mmcblk0rpmb: mmc0:0001 G1M15M 4.00 MiB, chardev (511:0)
+
+    RPMB ready at 3.388s — ~1s AFTER IMA's lookup (2.333s) and after OP-TEE core
+    (2.288s). The fTPM cannot function without RPMB, and RPMB itself postdates
+    IMA. Storage dependency, not a tunable race.
+
+--------------------------------------------------------------------------------
+[4] NVIDIA ships a userspace, EKB-PROVISIONED attestation path for the fTPM
+    grep -rniE "ftpm" /etc/systemd/nv-ftpm-device-provision.sh
+--------------------------------------------------------------------------------
+/etc/systemd/nv-ftpm-device-provision.sh:43:NV_FTPM_HELPER_APP="nvftpm-helper-app"
+/etc/systemd/nv-ftpm-device-provision.sh:49:FTPM_EKB_RSA_EK_PUB_KEY=".../ekb_rsa_ek_pub_key.pem"
+/etc/systemd/nv-ftpm-device-provision.sh:64:FTPM_RSA_EK_CERT=".../rsa_ek.cert"
+/etc/systemd/nv-ftpm-device-provision.sh:65:FTPM_EC_EK_CERT=".../ec_ek.cert"
+/etc/systemd/nv-ftpm-device-provision.sh:66:FTPM_OWNER_PW="owner"
+/etc/systemd/nv-ftpm-device-provision.sh:97:This script helps to provision fTPM via EKB.
+/etc/systemd/nv-ftpm-device-provision.sh:109:log_error "fTPM provisioning failed because of EKB extraction failed."
+
+    The intended NVIDIA flow: provision the fTPM from userspace via EKB
+    (Encrypted Key Blob) + nvftpm-helper-app, yielding RSA/EC EK certs and an
+    owner hierarchy. This is a userspace-mediated, provisioned attestation model
+    — NOT the kernel-space IMA -> PCR[10] model. On an UNPROVISIONED dev kit
+    (this device), ad-hoc tpm2-tools persistent handles are not anchored by this
+    flow, which is consistent with the observed AK-non-persistence across reboot.
+
+================================================================================
+ CONCLUSION
+ The fTPM is deliberately userspace-bound (denylist + manual modprobe after
+ supplicant + RPMB at 3.388s). IMA's one-shot lookup runs in kernel init, long
+ before any of this. The two attestation models — NVIDIA's userspace/EKB-
+ provisioned fTPM vs. kernel-space Linux IMA/PCR[10] — are structurally
+ incompatible on this platform. This is by design, not a defect.
+================================================================================

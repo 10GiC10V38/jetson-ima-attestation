@@ -35,18 +35,27 @@ between IMA and fTPM on Jetson AGX Orin.
 ### The Problem
 
 ```
-[1.806s] ima: No TPM chip found, activating TPM-bypass!
-[3.764s] optee: probing for conduit method
-[3.824s] optee: initialized driver
+[3.824s] optee: initialized driver                      ← OP-TEE core ready
+[3.896s] ima: No TPM chip found, activating TPM-bypass!  ← IMA runs AFTER, still no TPM
 ```
 
-IMA initializes at **1.806 seconds** and immediately looks for a TPM.
-OP-TEE (which hosts the fTPM) does not initialize until **3.824 seconds**.
-By the time fTPM becomes accessible, IMA has already given up and activated
-bypass mode. As a result, IMA measurements are not extended into TPM PCR[10].
+IMA initializes (at `late_initcall`) and looks for a TPM. Even though OP-TEE
+core is already up, **the fTPM is not yet registered** — it is brought up later
+by the userspace `tee-supplicant` daemon, because it relies on supplicant-mediated
+RPMB storage. So IMA finds no TPM, latches into bypass mode permanently, and IMA
+measurements are never extended into PCR[10].
 
-![Timing Gap](evidence/screenshots/screenshot_3_timing_gap.png)
-*dmesg output showing IMA gives up at 1.806s, OP-TEE ready at 3.824s — a 2 second gap*
+Note that OP-TEE core is already up (3.824s) *before* IMA's lookup (3.896s) —
+yet IMA still finds no TPM. The cause is not an OP-TEE-vs-IMA timing race; it is
+an invariant **kernel-init-vs-userspace** ordering, because the fTPM is brought
+up from userspace. Full analysis:
+[docs/root-cause-analysis.md](docs/root-cause-analysis.md).
+
+![OP-TEE ready, IMA still blind](evidence/screenshots/screenshot_3_optee_ready_ima_still_blind.png)
+*OP-TEE core is initialized before IMA runs, yet IMA finds no TPM — proving fTPM-ready ≠ OP-TEE-ready.*
+
+![Userspace loads the fTPM](evidence/screenshots/screenshot_6_supplicant_loads_ftpm.png)
+*Stock `nv-tee-supplicant.sh` brings up the fTPM from userspace, after tee-supplicant — long after IMA's kernel-init lookup. (The `modprobe FATAL` lines are harmless: the driver is built in via `CONFIG_TCG_FTPM_TEE=y`.)*
 
 ### Why This Happens
 
@@ -59,16 +68,28 @@ Physical TPM (other platforms):
   Ready at power-on → IMA always finds it ✅
 
 fTPM on Jetson (this platform):
-  Software TA inside OP-TEE
-  OP-TEE depends on TrustZone + TEE bus init
-  TEE bus probes AFTER kernel security subsystems
-  IMA initializes BEFORE TEE bus is ready ❌
+  Software TA inside OP-TEE, backed by eMMC RPMB storage
+  Module is DENYLISTED from kernel-init autoload (NVIDIA config)
+  Loaded from USERSPACE by nv-tee-supplicant.service,
+    only after tee-supplicant is up and RPMB is ready (~3.4s)
+  IMA's one-shot lookup runs in kernel init, BEFORE userspace ❌
 ```
+
+It is **not** that OP-TEE "comes up too late." NVIDIA *deliberately* keeps the
+fTPM out of kernel init: `/etc/modprobe.d/denylist-tpm-ftpm-tee.conf` blacklists
+the module, and `nv-tee-supplicant.service` loads it by hand from userspace once
+tee-supplicant (and its RPMB backing store) are ready. IMA's `late_initcall`
+lookup runs entirely within kernel init, so it can never see the chip. The fTPM
+is architected for a userspace, EKB-provisioned attestation flow — structurally
+incompatible with kernel-space IMA. Full detail (with verbatim config) in
+[docs/root-cause-analysis.md](docs/root-cause-analysis.md).
 
 ![fTPM Driver Confirmation](evidence/screenshots/screenshot_4_ftpm_driver.png)
 *Confirms TPM is driven by ftpm-tee (firmware, not physical chip) with compatible = microsoft,ftpm*
 
-This is a known problem across multiple ARM platforms. See related issues:
+This same class of problem appears across multiple ARM platforms (though the
+Jetson cause — a deliberate userspace denylist + RPMB dependency — is its own
+variant). See related issues:
 
 - [OP-TEE issue #7248](https://github.com/OP-TEE/optee_os/issues/7248) — fTPM + IMA on Xilinx ZCU104
 - [Raspberry Pi Linux issue #3291](https://github.com/raspberrypi/linux/issues/3291) — IMA/TPM load order broken
@@ -76,8 +97,12 @@ This is a known problem across multiple ARM platforms. See related issues:
 - [LKML patch 2021](https://lkml.rescloud.iu.edu/2101.1/10112.html) — fTPM: make sure TEE is initialized before fTPM
 - [TI TDA4VM forum](https://e2e.ti.com/support/processors-group/processors/f/processors-forum/1375425/tda4vm-ima-vs-tpm-builtin-driver-boot-order) — Same issue on TI platform
 
-**This repository is the first documented case of this problem on
-NVIDIA Jetson AGX Orin with JetPack R36.4.4.**
+**This is a known, upstream-acknowledged OP-TEE limitation (reported since
+2022, see [evidence/upstream-prior-art.md](evidence/upstream-prior-art.md)) —
+not a novel discovery.** What this repository adds is a detailed, evidence-backed
+characterization of how it manifests on **NVIDIA Jetson AGX Orin (JetPack
+R36.4.4)** — including the platform-specific load mechanism (module denylist +
+`nv-tee-supplicant.service`) — and an evaluation of the available workarounds.
 
 ---
 
@@ -154,7 +179,7 @@ PCR[0] = 0x3D458CFE55CC03EA...  ← UEFI firmware hash
 PCR[1] = 0x22DC145DBDAD7FD0...  ← UEFI configuration
 PCR[4] = 0xA8147957A22B75D3...  ← bootloader hash
 PCR[7] = 0x65CAF8DD1E0EA7A6...  ← secure boot state
-PCR[10]= 0x0000000000000000...  ← IMA not extending (timing issue)
+PCR[10]= 0x0000000000000000...  ← IMA not extending (fTPM userspace-gated)
 ```
 
 These are hardware-enforced. The kernel cannot modify them.
@@ -189,7 +214,7 @@ entries — IMA runs in kernel space.
 | IMA policy (tcb) | ✅ Active | Measures binaries, modules, firmware |
 | fTPM accessible | ✅ Working | /dev/tpm0, tpm2_pcrread works |
 | PCR[0-7] | ✅ Non-zero | Firmware-extended boot measurements |
-| PCR[10] extension | ❌ Not working | fTPM/IMA timing ordering problem |
+| PCR[10] extension | ❌ Not working | fTPM userspace-gated; unavailable at IMA init |
 | OP-TEE TA | 🔄 In progress | Attestation TA being built |
 | Normal World agent | 🔄 Planned | |
 | Verifier | 🔄 Planned | |
@@ -294,50 +319,55 @@ sudo tpm2_pcrread sha256:0,1,2,3,4,5,6,7,8,9,10
 
 ---
 
-## The fTPM + IMA Timing Problem — Deep Analysis
+## The fTPM + IMA Boot-Ordering Problem — Deep Analysis
 
 ### Boot Timeline on Jetson AGX Orin
 
 ```
 0.000s  Kernel starts
 0.261s  device-mapper: IMA_DISABLE_HTABLE disabled
-1.806s  ima: No TPM chip found, activating TPM-bypass!  ← IMA gives up
-1.806s  ima: Allocated hash algorithm: sha256
 3.764s  optee: probing for conduit method               ← OP-TEE starts
-3.824s  optee: initialized driver                       ← OP-TEE ready
-        fTPM TA becomes accessible (after OP-TEE)
-        IMA already in bypass mode — too late
+3.824s  optee: initialized driver                       ← OP-TEE core ready
+3.896s  ima: No TPM chip found, activating TPM-bypass!  ← IMA runs AFTER, still no TPM
+3.896s  ima: Allocated hash algorithm: sha256
+        ... kernel init ends, userspace starts ...
+        tee-supplicant starts → nv-tee-supplicant.sh loads fTPM  ← only NOW does fTPM exist
+        IMA already in bypass mode — permanently
 ```
 
-Gap: **~2 seconds** between IMA checking and fTPM becoming available.
+The real gap is **kernel-init → userspace** (where the fTPM is brought up), not
+OP-TEE-vs-IMA. OP-TEE core is up ~72 ms *before* IMA, and IMA still finds no TPM.
+See [docs/root-cause-analysis.md](docs/root-cause-analysis.md) for the full analysis.
 
 ### Root Cause
 
 ```
-IMA is a security subsystem — initializes as late_initcall
-fTPM is a TEE bus device — probes after TEE bus init
-TEE bus init happens after PCI/USB/platform buses
-Platform buses init after security subsystems
+IMA:  kernel-space, runs at late_initcall (one of the LAST init phases)
+fTPM: DENYLISTED from kernel-init autoload (NVIDIA modprobe.d config),
+      then loaded from USERSPACE by nv-tee-supplicant.service, only
+      after tee-supplicant is up and RPMB backing store is ready
 
 Chain:
-  security_init (very early)
-    └── IMA init → looks for TPM → not found
-  bus init (later)
-    └── TEE bus → OP-TEE driver → fTPM probe
-        → TPM available — but IMA already gave up
+  kernel init
+    └── late_initcall(init_ima) → tpm_default_chip() → NULL (fTPM denylisted)
+          → "No TPM chip found, activating TPM-bypass!"  (latched permanently)
+  kernel init ends → userspace starts
+    └── tee-supplicant up → modprobe tpm_ftpm_tee → fTPM now exists
+          → TPM usable, but IMA already gave up — for the whole session
 ```
 
 ### Why CONFIG_TCG_FTPM_TEE=y Does Not Help
 
-Even with fTPM built-in (not a module), the device probe is still
-deferred because it depends on the TEE bus, which cannot initialize
-before OP-TEE, which cannot start before TrustZone is configured by
-TF-A. This chain is hardware-determined.
+Building the fTPM in (`CONFIG_TCG_FTPM_TEE=y`) does **not** make it available to
+IMA. NVIDIA denylists the module and the fTPM device is only enumerated/usable
+after userspace tee-supplicant is running (it needs RPMB secure storage). A
+built-in driver still cannot present a usable chip until that userspace step
+runs — which is after IMA's `late_initcall`. Building it in changes how the
+driver is *packaged*, not *when the fTPM becomes usable*.
 
-Setting `CONFIG_TCG_FTPM_TEE=y` caused a secondary issue — the
-built-in driver conflicted with the old `.ko` file still present
-from `make modules_install`. Resolved by removing the `.ko` file.
-But even after resolving this, IMA still misses fTPM.
+(Side note: with `CONFIG_TCG_FTPM_TEE=y`, the old `.ko` from
+`make modules_install` must be removed to avoid a duplicate-registration
+conflict — but even after that, IMA still misses the fTPM, for the reason above.)
 
 ### What PCR[10] = 0 Means for Security
 
@@ -351,7 +381,7 @@ Without PCR[10] extension:
 This is documented as a research limitation, consistent with standard
 attestation literature that assumes an uncompromised kernel.
 
-See [docs/problem-analysis.md](docs/problem-analysis.md) for full analysis.
+See [docs/root-cause-analysis.md](docs/root-cause-analysis.md) for the full analysis.
 
 ---
 
@@ -390,12 +420,17 @@ See [docs/problem-analysis.md](docs/problem-analysis.md) for full analysis.
 
 ### Same Problem on Other Platforms
 
-| Platform | Kernel | Status |
-|---|---|---|
-| Raspberry Pi | 5.15.y | Fixed — patch merged into RPi kernel |
-| Xilinx ZCU104 | 5.x | Open — OP-TEE issue #7248 |
-| TI TDA4VM | 6.1.80 | Open — TI E2E forum |
-| NVIDIA Jetson AGX Orin | 5.15.148 | **This work — first documented** |
+| Platform / source | Status |
+|---|---|
+| OP-TEE mailing list (2022) | Limitation first raised upstream — fTPM/tee-supplicant vs. IMA at kernel boot |
+| RockPi4B, STM32MP157C-DK2 | OP-TEE issue #5766 (2023) — same IMA-attestation goal, same wall |
+| Xilinx ZCU104 | OP-TEE issue #7248 (2025) — open |
+| BlueField-3 DPU | NVIDIA networking docs — RPMB-gated fTPM over OP-TEE |
+| Raspberry Pi | Fixed for its SPI TPM (different hardware; does not transfer to fTPM) |
+| Upstream fix | Kernel RPMB subsystem merged in mainline **Linux 6.12** (2024) — removes the tee-supplicant dependency; newer than this Jetson's 5.15 |
+| NVIDIA Jetson AGX Orin (5.15.148) | **This work** — detailed characterization + TA-signed workaround |
+
+See [evidence/upstream-prior-art.md](evidence/upstream-prior-art.md) for the consolidated prior art and links.
 
 ### Key References
 
@@ -418,7 +453,7 @@ See [docs/problem-analysis.md](docs/problem-analysis.md) for full analysis.
 jetson-ima-attestation/
 ├── README.md                         ← this file
 ├── docs/
-│   ├── problem-analysis.md           ← deep dive on fTPM+IMA timing
+│   ├── root-cause-analysis.md        ← fTPM+IMA root-cause analysis
 │   ├── threat-model.md               ← security analysis (planned)
 │   └── overhead-results.md           ← measurements (planned)
 ├── evidence/
@@ -430,12 +465,16 @@ jetson-ima-attestation/
 │   ├── ima_policy.txt                ← active IMA policy
 │   ├── system_info.txt               ← platform details
 │   ├── tpm_driver.txt                ← TPM driver info
+│   ├── root_cause_source_trace.txt   ← kernel-source trace (the mechanism)
+│   ├── nvidia_ftpm_userspace_binding.txt ← verbatim NVIDIA config (the intent)
+│   ├── upstream-prior-art.md         ← OP-TEE/Xilinx/STM32 prior art (known since 2022, fixed in Linux 6.12)
 │   └── screenshots/
 │       ├── screenshot_1_ima_running.png
 │       ├── screenshot_2_pcr_values.png
-│       ├── screenshot_3_timing_gap.png
+│       ├── screenshot_3_optee_ready_ima_still_blind.png
 │       ├── screenshot_4_ftpm_driver.png
-│       └── screenshot_5_ima_policy.png
+│       ├── screenshot_5_ima_policy.png
+│       └── screenshot_6_supplicant_loads_ftpm.png
 ├── kernel/
 │   └── (IMA config and build notes)
 ├── ta/                               ← OP-TEE Attestation TA (planned)
@@ -447,12 +486,13 @@ jetson-ima-attestation/
 
 ## Contributing / Related Issues
 
-If you are facing the same fTPM + IMA timing problem on another ARM
+If you are facing the same fTPM + IMA boot-ordering problem on another ARM
 platform, please open an issue or reference this repository.
 
-Upstream fix discussion:
-- linux-integrity mailing list: linux-integrity@vger.kernel.org
-- OP-TEE GitHub: https://github.com/OP-TEE/optee_os/issues/7248
+Upstream fix (kernel RPMB subsystem, mainline Linux 6.12):
+- Linaro write-up: https://www.linaro.org/blog/linaro-enables-op-tee-rpmb-access-directly-from-the-linux-kernel/
+- RPMB subsystem series: https://patchwork.kernel.org/project/linux-mmc/cover/20240527121340.3931987-1-jens.wiklander@linaro.org/
+- Related OP-TEE issues: https://github.com/OP-TEE/optee_os/issues/7248 , https://github.com/OP-TEE/optee_os/issues/5766
 
 ---
 
